@@ -200,6 +200,13 @@ internal class PublishCommandExecutor
 
         try
         {
+            // Reject an out-of-range secret lifetime before prompting or creating apps; register enforces the same 1-24 bound.
+            if (args.SecretLifetimeMonths is { } lifetime && (lifetime < 1 || lifetime > 24))
+            {
+                _logger.LogError("--secret-lifetime-months must be between 1 and 24 (Graph's maximum is ~2 years). Got: {Value}", lifetime);
+                return null;
+            }
+
             var environmentId = args.EnvironmentId;
             if (string.IsNullOrWhiteSpace(environmentId))
             {
