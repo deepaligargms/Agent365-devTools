@@ -115,6 +115,39 @@ public class PublishCommandExecutorEntraAppTests
             because: "the platform needs the proxy app's secret to create the connector; without it it logs SkippedNoCredentials");
     }
 
+    /// <summary>
+    /// ServiceTree-enrolled tenants reject app registrations without a serviceManagementReference,
+    /// and strict tenants cap secret lifetimes; both the A365 proxy and Public Clients apps must
+    /// therefore receive <c>--service-tree-id</c>, and the proxy secret must honor
+    /// <c>--secret-lifetime-months</c>, exactly as the register flow does.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_ForwardsServiceTreeIdAndSecretLifetime_ToEntraAppCreation()
+    {
+        var logger = Substitute.For<ILogger>();
+        var tooling = Substitute.For<IAgent365ToolingService>();
+        var graph = Substitute.For<GraphApiService>();
+
+        ArrangeSuccessfulAppCreation(graph);
+
+        tooling.PublishServerAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<PublishMcpServerRequest>(), Arg.Any<CancellationToken>())
+            .Returns(new PublishMcpServerResponse { Status = "Success" });
+
+        var args = MakeArgs() with { ServiceTreeId = "st-123", SecretLifetimeMonths = 6 };
+
+        var executor = MakeExecutor(logger, tooling, graph);
+
+        var result = await executor.ExecuteAsync(args, CancellationToken.None);
+
+        result.Should().BeTrue();
+        await graph.Received(1).CreateEntraAppAsync(
+            TenantId, Arg.Is<string>(n => n.EndsWith("-A365Proxy")), "st-123", Arg.Any<CancellationToken>());
+        await graph.Received(1).CreateEntraAppAsync(
+            TenantId, Arg.Is<string>(n => n.EndsWith("-PublicClients")), "st-123", Arg.Any<CancellationToken>());
+        await graph.Received(1).AddAppPasswordAsync(
+            TenantId, "proxy-object-id", Arg.Any<string>(), 6, Arg.Any<CancellationToken>());
+    }
+
     [Fact]
     public async Task ExecuteAsync_WhenProxyRedirectUriReturned_UpdatesProxyAppRedirectUris()
     {
@@ -141,7 +174,7 @@ public class PublishCommandExecutorEntraAppTests
     }
 
     [Fact]
-    public async Task ExecuteAsync_WhenProxyRedirectUriMissing_WarnsAndSkipsRedirectUpdate()
+    public async Task ExecuteAsync_WhenConnectorCreatedButRedirectUriMissing_WarnsAndSkipsRedirectUpdate()
     {
         var logger = Substitute.For<ILogger>();
         var tooling = Substitute.For<IAgent365ToolingService>();
@@ -149,8 +182,10 @@ public class PublishCommandExecutorEntraAppTests
 
         ArrangeSuccessfulAppCreation(graph);
 
+        // Connector was created (id present) but no redirect URI came back — a real anomaly worth a
+        // warning, unlike the first-party case where no connector is expected at all.
         tooling.PublishServerAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<PublishMcpServerRequest>(), Arg.Any<CancellationToken>())
-            .Returns(new PublishMcpServerResponse { Status = "Success" });
+            .Returns(new PublishMcpServerResponse { Status = "Success", A365ProxyConnectorId = "connector-id" });
 
         var executor = MakeExecutor(logger, tooling, graph);
 
@@ -162,9 +197,70 @@ public class PublishCommandExecutorEntraAppTests
         logger.Received().Log(
             LogLevel.Warning,
             Arg.Any<EventId>(),
-            Arg.Is<object>(o => o.ToString()!.Contains("A365 Proxy redirect URI was not returned")),
+            Arg.Is<object>(o => o.ToString()!.Contains("connector was created but publish returned no redirect URI")),
             Arg.Any<Exception?>(),
             Arg.Any<Func<object, Exception?, string>>());
+    }
+
+    /// <summary>
+    /// The proxy app + secret are forwarded on every publish because the CLI can't classify the
+    /// server before the platform does. When the response shows no connector was created (a
+    /// first-party / Dataverse server), the proxy credential is unused and must be deleted so it
+    /// doesn't linger in the tenant. The Public Clients app must be left in place.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_WhenNoConnectorCreated_DeletesUnusedProxyApp_AndSkipsRedirectUpdate()
+    {
+        var logger = Substitute.For<ILogger>();
+        var tooling = Substitute.For<IAgent365ToolingService>();
+        var graph = Substitute.For<GraphApiService>();
+
+        var (_, _, proxyObjectId) = ArrangeSuccessfulAppCreation(graph);
+
+        // No connector id and no redirect URI => the platform created no connector for this server.
+        tooling.PublishServerAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<PublishMcpServerRequest>(), Arg.Any<CancellationToken>())
+            .Returns(new PublishMcpServerResponse { Status = "Success" });
+
+        var executor = MakeExecutor(logger, tooling, graph);
+
+        var result = await executor.ExecuteAsync(MakeArgs(), CancellationToken.None);
+
+        result.Should().BeTrue();
+        await graph.Received(1).DeleteEntraAppAsync(TenantId, proxyObjectId, Arg.Any<CancellationToken>());
+        await graph.DidNotReceive().DeleteEntraAppAsync(TenantId, "pc-object-id", Arg.Any<CancellationToken>());
+        await graph.DidNotReceive().UpdateAppRedirectUrisAsync(
+            Arg.Any<string>(), Arg.Any<string>(), Arg.Any<IEnumerable<string>>(), Arg.Any<CancellationToken>());
+    }
+
+    /// <summary>
+    /// If Public Clients creation throws after the confidential proxy app (with its secret) is
+    /// created, the proxy app is orphaned unless explicitly cleaned up — the failure predates the
+    /// full <c>EntraAppSet</c> that the platform-failure rollback path deletes. The executor must
+    /// delete the proxy app itself and fail the publish without calling the platform.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_WhenPublicClientsCreationThrows_DeletesOrphanedProxyApp_AndAbortsPublish()
+    {
+        var logger = Substitute.For<ILogger>();
+        var tooling = Substitute.For<IAgent365ToolingService>();
+        var graph = Substitute.For<GraphApiService>();
+
+        const string proxyObjectId = "proxy-object-id";
+        graph.CreateEntraAppAsync(Arg.Any<string>(), Arg.Is<string>(n => n.EndsWith("-A365Proxy")), Arg.Any<string?>(), Arg.Any<CancellationToken>())
+            .Returns((proxyObjectId, "proxy-client-id"));
+        graph.AddAppPasswordAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<string>(), Arg.Any<int?>(), Arg.Any<CancellationToken>())
+            .Returns("proxy-secret");
+        graph.CreateEntraAppAsync(Arg.Any<string>(), Arg.Is<string>(n => n.EndsWith("-PublicClients")), Arg.Any<string?>(), Arg.Any<CancellationToken>())
+            .Returns<(string, string)?>(_ => throw new InvalidOperationException("graph throttled"));
+        graph.DeleteEntraAppAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<CancellationToken>()).Returns(true);
+
+        var executor = MakeExecutor(logger, tooling, graph);
+
+        var result = await executor.ExecuteAsync(MakeArgs(), CancellationToken.None);
+
+        result.Should().BeFalse("a failure creating the Public Clients app must abort the publish");
+        await graph.Received(1).DeleteEntraAppAsync(TenantId, proxyObjectId, Arg.Any<CancellationToken>());
+        await tooling.DidNotReceiveWithAnyArgs().PublishServerAsync(default!, default!, default!, default);
     }
 
     /// <summary>
@@ -197,6 +293,7 @@ public class PublishCommandExecutorEntraAppTests
                 Status = "Success",
                 McpServerAppId = mcpServerAppId,
                 McpServerScope = mcpServerScope,
+                A365ProxyConnectorId = "connector-id",
             });
 
         var executor = MakeExecutor(logger, tooling, graph);
