@@ -203,10 +203,11 @@ public class PublishCommandExecutorEntraAppTests
     }
 
     /// <summary>
-    /// The proxy app + secret are forwarded on every publish because the CLI can't classify the
-    /// server before the platform does. When the response shows no connector was created (a
-    /// first-party / Dataverse server), the proxy credential is unused and must be deleted so it
-    /// doesn't linger in the tenant. The Public Clients app must be left in place.
+    /// A custom server normally gets a connector, but if the platform returns no connector (the CLI's
+    /// name classification drifted from the platform's, or the platform treats the server as
+    /// first-party), the proxy app created for it is unused and must be reconciled away so it doesn't
+    /// linger in the tenant. The Public Clients app must be left in place. (Servers classified as
+    /// first-party up front never create a proxy app, so they never reach this reconcile path.)
     /// </summary>
     [Fact]
     public async Task ExecuteAsync_WhenNoConnectorCreated_DeletesUnusedProxyApp_AndSkipsRedirectUpdate()
@@ -332,6 +333,120 @@ public class PublishCommandExecutorEntraAppTests
 
         await graph.Received(1).DeleteEntraAppAsync(TenantId, "pc-object-id", Arg.Any<CancellationToken>());
         await graph.Received(1).DeleteEntraAppAsync(TenantId, "proxy-object-id", Arg.Any<CancellationToken>());
+    }
+
+    /// <summary>
+    /// First-party (OOB) Dataverse servers are fronted by the platform's own Entra app. Publish must
+    /// classify them by name up front and NOT create an A365 proxy app or secret, and must send null
+    /// (not empty) proxy credentials: the platform's v2 publish binds the proxy client id as a Guid?,
+    /// where null means "no connector needed" and an empty string is a 400. Only the Public Clients
+    /// app is created, and there is no unused proxy app to reconcile away.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_WhenFirstPartyDataverseServer_SkipsProxyApp_AndSendsNullProxyCredentials()
+    {
+        var logger = Substitute.For<ILogger>();
+        var tooling = Substitute.For<IAgent365ToolingService>();
+        var graph = Substitute.For<GraphApiService>();
+
+        graph.CreateEntraAppAsync(Arg.Any<string>(), Arg.Is<string>(n => n.EndsWith("-PublicClients")), Arg.Any<string?>(), Arg.Any<CancellationToken>())
+            .Returns(("pc-object-id", "pc-client-id"));
+        graph.UpdateAppPublicClientRedirectUrisAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<IEnumerable<string>>(), Arg.Any<CancellationToken>())
+            .Returns(true);
+
+        PublishMcpServerRequest? capturedRequest = null;
+        tooling.PublishServerAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Do<PublishMcpServerRequest>(r => capturedRequest = r), Arg.Any<CancellationToken>())
+            .Returns(new PublishMcpServerResponse { Status = "Success" });
+
+        var executor = MakeExecutor(logger, tooling, graph);
+        var args = MakeArgs() with { ServerName = "msdyn_DataverseMCPServer" };
+
+        var result = await executor.ExecuteAsync(args, CancellationToken.None);
+
+        result.Should().BeTrue();
+        await graph.DidNotReceive().CreateEntraAppAsync(
+            Arg.Any<string>(), Arg.Is<string>(n => n.EndsWith("-A365Proxy")), Arg.Any<string?>(), Arg.Any<CancellationToken>());
+        await graph.DidNotReceiveWithAnyArgs().AddAppPasswordAsync(default!, default!, default!, default, default);
+        await graph.Received(1).CreateEntraAppAsync(
+            Arg.Any<string>(), Arg.Is<string>(n => n.EndsWith("-PublicClients")), Arg.Any<string?>(), Arg.Any<CancellationToken>());
+
+        capturedRequest.Should().NotBeNull();
+        capturedRequest!.A365ProxyClientId.Should().BeNull(
+            because: "a first-party server has no proxy app; the platform binds proxy client id as Guid? and a null (not empty) value signals 'no connector needed', avoiding a 400");
+        capturedRequest.A365ProxyClientSecret.Should().BeNull(
+            because: "no proxy secret is created for first-party servers");
+
+        await graph.DidNotReceiveWithAnyArgs().DeleteEntraAppAsync(default!, default!, default);
+    }
+
+    /// <summary>
+    /// Rollback runs because a publish failed - frequently because the caller cancelled (Ctrl+C). It
+    /// must therefore delete the just-created apps with a cancellation-independent token, not the
+    /// caller's (already-cancelled) token; otherwise the Public Clients app and the confidential proxy
+    /// app (with its live secret) are left orphaned in the tenant.
+    /// </summary>
+    [Fact]
+    public async Task RollbackEntraAppsAsync_UsesCancellationIndependentToken_WhenCallerTokenIsCancelled()
+    {
+        var logger = Substitute.For<ILogger>();
+        var tooling = Substitute.For<IAgent365ToolingService>();
+        var graph = Substitute.For<GraphApiService>();
+        graph.DeleteEntraAppAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<CancellationToken>()).Returns(true);
+
+        var executor = MakeExecutor(logger, tooling, graph);
+
+        var apps = new PublishCommandExecutor.EntraAppSet(
+            PublicClientsClientId: "pc-client-id",
+            PublicClientsObjectId: "pc-object-id",
+            PublicClientsAppName: $"{ServerName}-PublicClients",
+            A365AppClientId: "proxy-client-id",
+            A365AppSecret: "proxy-secret",
+            A365AppObjectId: "proxy-object-id",
+            A365AppName: $"{ServerName}-A365Proxy");
+
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        await executor.RollbackEntraAppsAsync(apps, TenantId, cts.Token);
+
+        await graph.Received(1).DeleteEntraAppAsync(
+            TenantId, "pc-object-id", Arg.Is<CancellationToken>(t => !t.IsCancellationRequested));
+        await graph.Received(1).DeleteEntraAppAsync(
+            TenantId, "proxy-object-id", Arg.Is<CancellationToken>(t => !t.IsCancellationRequested));
+    }
+
+    /// <summary>
+    /// When the publish response shows no connector (the proxy app is unused) AND the automatic delete
+    /// of that proxy app fails, the executor must surface a user-facing warning to delete it manually.
+    /// A silent delete failure would leave an unused confidential app (with a live secret) in the
+    /// tenant with no signal to the user.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_WhenUnusedProxyDeleteFails_SurfacesManualCleanupWarning()
+    {
+        var logger = Substitute.For<ILogger>();
+        var tooling = Substitute.For<IAgent365ToolingService>();
+        var graph = Substitute.For<GraphApiService>();
+
+        ArrangeSuccessfulAppCreation(graph);
+        // The reconcile delete of the unused proxy app fails (overrides the arrange's success stub).
+        graph.DeleteEntraAppAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<CancellationToken>()).Returns(false);
+
+        // No connector id and no redirect URI => the platform created no connector => proxy is unused.
+        tooling.PublishServerAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<PublishMcpServerRequest>(), Arg.Any<CancellationToken>())
+            .Returns(new PublishMcpServerResponse { Status = "Success" });
+
+        var executor = MakeExecutor(logger, tooling, graph);
+
+        var result = await executor.ExecuteAsync(MakeArgs(), CancellationToken.None);
+
+        result.Should().BeTrue("a failed cleanup of an unused proxy app is a warning, not a publish failure");
+        logger.Received().Log(
+            LogLevel.Warning,
+            Arg.Any<EventId>(),
+            Arg.Is<object>(o => o.ToString()!.Contains("could not be deleted automatically")),
+            Arg.Any<Exception?>(),
+            Arg.Any<Func<object, Exception?, string>>());
     }
 
     /// <summary>

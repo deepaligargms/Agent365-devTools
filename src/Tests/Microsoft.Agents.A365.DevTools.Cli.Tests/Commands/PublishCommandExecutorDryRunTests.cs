@@ -103,4 +103,48 @@ public class PublishCommandExecutorDryRunTests
         // Dry-run short-circuits before the platform publish call regardless of publisher.
         await toolingService.DidNotReceiveWithAnyArgs().PublishServerAsync(default!, default!, default!, default);
     }
+
+    /// <summary>
+    /// Dry-run for a first-party Dataverse server must describe only the Public Clients app and make
+    /// clear no A365 proxy app/secret/connector is created, so the preview matches classify-first
+    /// behavior. It must not claim it will forward proxy credentials, and must skip the platform call.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_DryRun_FirstPartyDataverseServer_DescribesPublicClientsOnly_NoProxy()
+    {
+        var logger = Substitute.For<ILogger>();
+        var toolingService = Substitute.For<IAgent365ToolingService>();
+
+        var args = new RawPublishArgs(
+            EnvironmentId: "00000000-0000-0000-0000-000000000000",
+            ServerName: "msdyn_DataverseMCPServer",
+            Alias: "myAlias",
+            DisplayName: "Test Display",
+            PublisherName: null,
+            Yes: false,
+            DryRun: true);
+
+        var executor = new PublishCommandExecutor(logger, toolingService, graphApiService: null);
+
+        await executor.ExecuteAsync(args, CancellationToken.None);
+
+        logger.Received(1).Log(
+            LogLevel.Information,
+            Arg.Any<EventId>(),
+            Arg.Is<object>(o =>
+                o.ToString()!.Contains("first-party Dataverse MCP server") &&
+                o.ToString()!.Contains("msdyn_DataverseMCPServer-PublicClients")),
+            Arg.Any<Exception?>(),
+            Arg.Any<Func<object, Exception?, string>>());
+
+        // Must NOT claim it will forward proxy credentials — that line is only for custom servers.
+        logger.DidNotReceive().Log(
+            LogLevel.Information,
+            Arg.Any<EventId>(),
+            Arg.Is<object>(o => o.ToString()!.Contains("forward the A365 proxy app credentials")),
+            Arg.Any<Exception?>(),
+            Arg.Any<Func<object, Exception?, string>>());
+
+        await toolingService.DidNotReceiveWithAnyArgs().PublishServerAsync(default!, default!, default!, default);
+    }
 }
