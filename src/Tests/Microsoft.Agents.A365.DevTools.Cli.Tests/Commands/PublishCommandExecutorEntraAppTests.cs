@@ -450,6 +450,46 @@ public class PublishCommandExecutorEntraAppTests
     }
 
     /// <summary>
+    /// Cancellation can arrive after both Entra apps are provisioned but before the platform publish
+    /// call. The pre-publish cancellation check must roll back BOTH apps (including the confidential
+    /// proxy app and its live secret) before propagating the cancellation; otherwise they are leaked
+    /// in the tenant with no corresponding platform record. The direct RollbackEntraAppsAsync test
+    /// does not exercise this ExecuteAsync path.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_WhenCancelledAfterProvisioning_RollsBackBothApps_AndSkipsPlatformCall()
+    {
+        var logger = Substitute.For<ILogger>();
+        var tooling = Substitute.For<IAgent365ToolingService>();
+        var graph = Substitute.For<GraphApiService>();
+
+        ArrangeSuccessfulAppCreation(graph);
+
+        using var cts = new CancellationTokenSource();
+        // Cancel on the last provisioning Graph call (public-client redirect URIs) so both apps are
+        // fully created and the next cancellation check in ExecuteAsync observes the cancellation.
+        graph.When(g => g.UpdateAppPublicClientRedirectUrisAsync(
+                Arg.Any<string>(), Arg.Any<string>(), Arg.Any<IEnumerable<string>>(), Arg.Any<CancellationToken>()))
+            .Do(_ => cts.Cancel());
+
+        var executor = MakeExecutor(logger, tooling, graph);
+
+        var act = async () => await executor.ExecuteAsync(MakeArgs(), cts.Token);
+
+        await act.Should().ThrowAsync<OperationCanceledException>(
+            because: "a cancellation observed after provisioning but before the platform call must propagate, not be swallowed");
+
+        // Both apps rolled back, with a cancellation-independent token so the already-cancelled
+        // caller token does not skip the deletes.
+        await graph.Received(1).DeleteEntraAppAsync(
+            TenantId, "pc-object-id", Arg.Is<CancellationToken>(t => !t.IsCancellationRequested));
+        await graph.Received(1).DeleteEntraAppAsync(
+            TenantId, "proxy-object-id", Arg.Is<CancellationToken>(t => !t.IsCancellationRequested));
+        // No platform call occurred, so there is nothing published to compensate for beyond the apps.
+        await tooling.DidNotReceiveWithAnyArgs().PublishServerAsync(default!, default!, default!, default);
+    }
+
+    /// <summary>
     /// Overrides only the tenant-detection seam (which shells out to Azure CLI) so the rest of the
     /// executor runs unchanged against the substituted Graph and tooling services.
     /// </summary>

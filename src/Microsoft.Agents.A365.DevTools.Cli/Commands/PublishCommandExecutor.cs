@@ -148,7 +148,13 @@ internal class PublishCommandExecutor
         var apps = await CreateEntraAppsAsync(input, tenantId, warnings, ct);
         if (apps is null) return false;
 
-        ct.ThrowIfCancellationRequested();
+        if (ct.IsCancellationRequested)
+        {
+            // Both apps exist but no platform call has happened yet; roll them back before surfacing
+            // the cancellation so the confidential proxy app and its live secret aren't leaked.
+            await RollbackEntraAppsAsync(apps, tenantId, ct);
+            ct.ThrowIfCancellationRequested();
+        }
 
         var request = new PublishMcpServerRequest
         {
