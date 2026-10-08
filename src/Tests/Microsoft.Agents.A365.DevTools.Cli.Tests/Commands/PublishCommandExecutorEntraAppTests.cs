@@ -203,11 +203,12 @@ public class PublishCommandExecutorEntraAppTests
     }
 
     /// <summary>
-    /// A custom server normally gets a connector, but if the platform returns no connector (the CLI's
-    /// name classification drifted from the platform's, or the platform treats the server as
-    /// first-party), the proxy app created for it is unused and must be reconciled away so it doesn't
-    /// linger in the tenant. The Public Clients app must be left in place. (Servers classified as
-    /// first-party up front never create a proxy app, so they never reach this reconcile path.)
+    /// A custom server normally gets a connector, but if the platform returns a real payload that
+    /// reports no connector (the CLI's name classification drifted from the platform's, or the platform
+    /// treats the server as first-party), the proxy app created for it is unused and must be reconciled
+    /// away so it doesn't linger in the tenant. The Public Clients app must be left in place. A "real
+    /// payload" is distinguished by McpServerAppId being present - see the metadata-free placeholder
+    /// case in <see cref="ExecuteAsync_WhenPublishReturnsMetadataFreeSuccess_KeepsProxyApp_AndWarns"/>.
     /// </summary>
     [Fact]
     public async Task ExecuteAsync_WhenNoConnectorCreated_DeletesUnusedProxyApp_AndSkipsRedirectUpdate()
@@ -218,9 +219,10 @@ public class PublishCommandExecutorEntraAppTests
 
         var (_, _, proxyObjectId) = ArrangeSuccessfulAppCreation(graph);
 
-        // No connector id and no redirect URI => the platform created no connector for this server.
+        // Real v2 payload (McpServerAppId present) with no connector id and no redirect URI => the
+        // platform genuinely created no connector for this server.
         tooling.PublishServerAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<PublishMcpServerRequest>(), Arg.Any<CancellationToken>())
-            .Returns(new PublishMcpServerResponse { Status = "Success" });
+            .Returns(new PublishMcpServerResponse { Status = "Success", McpServerAppId = "1a2a0eb6-0000-0000-0000-000000000000" });
 
         var executor = MakeExecutor(logger, tooling, graph);
 
@@ -231,6 +233,42 @@ public class PublishCommandExecutorEntraAppTests
         await graph.DidNotReceive().DeleteEntraAppAsync(TenantId, "pc-object-id", Arg.Any<CancellationToken>());
         await graph.DidNotReceive().UpdateAppRedirectUrisAsync(
             Arg.Any<string>(), Arg.Any<string>(), Arg.Any<IEnumerable<string>>(), Arg.Any<CancellationToken>());
+    }
+
+    /// <summary>
+    /// The tooling layer returns a placeholder <c>{ Status = "Success" }</c> (every connector field and
+    /// McpServerAppId null) when the platform answers 2xx with an empty or undeserializable body. By
+    /// then the proxy client id and secret have already been sent, so the platform may have created the
+    /// connector. Deleting the proxy app here would orphan that connector's OAuth client. The executor
+    /// must therefore keep the proxy app, warn naming it and its clientId, and still exit success.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_WhenPublishReturnsMetadataFreeSuccess_KeepsProxyApp_AndWarns()
+    {
+        var logger = Substitute.For<ILogger>();
+        var tooling = Substitute.For<IAgent365ToolingService>();
+        var graph = Substitute.For<GraphApiService>();
+
+        var (proxyClientId, _, proxyObjectId) = ArrangeSuccessfulAppCreation(graph);
+
+        // Metadata-free placeholder: a 2xx with no body => no McpServerAppId and no connector fields.
+        // This must NOT be read as proof that no connector was created.
+        tooling.PublishServerAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<PublishMcpServerRequest>(), Arg.Any<CancellationToken>())
+            .Returns(new PublishMcpServerResponse { Status = "Success" });
+
+        var executor = MakeExecutor(logger, tooling, graph);
+
+        var result = await executor.ExecuteAsync(MakeArgs(), CancellationToken.None);
+
+        result.Should().BeTrue("a 2xx publish still succeeds even when the body carries no metadata");
+        await graph.DidNotReceive().DeleteEntraAppAsync(TenantId, proxyObjectId, Arg.Any<CancellationToken>());
+        logger.Received().Log(
+            LogLevel.Warning,
+            Arg.Any<EventId>(),
+            Arg.Is<object>(o => o.ToString()!.Contains("connector creation could not be confirmed")
+                && o.ToString()!.Contains(proxyClientId)),
+            Arg.Any<Exception?>(),
+            Arg.Any<Func<object, Exception?, string>>());
     }
 
     /// <summary>
@@ -432,9 +470,10 @@ public class PublishCommandExecutorEntraAppTests
         // The reconcile delete of the unused proxy app fails (overrides the arrange's success stub).
         graph.DeleteEntraAppAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<CancellationToken>()).Returns(false);
 
-        // No connector id and no redirect URI => the platform created no connector => proxy is unused.
+        // Real v2 payload (McpServerAppId present) with no connector => proxy is unused and the
+        // reconcile tries to delete it; that delete failing is what this test exercises.
         tooling.PublishServerAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<PublishMcpServerRequest>(), Arg.Any<CancellationToken>())
-            .Returns(new PublishMcpServerResponse { Status = "Success" });
+            .Returns(new PublishMcpServerResponse { Status = "Success", McpServerAppId = "1a2a0eb6-0000-0000-0000-000000000000" });
 
         var executor = MakeExecutor(logger, tooling, graph);
 

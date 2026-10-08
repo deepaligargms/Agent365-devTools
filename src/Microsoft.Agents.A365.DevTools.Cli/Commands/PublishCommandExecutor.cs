@@ -504,22 +504,37 @@ internal class PublishCommandExecutor
         var tasks = new List<Task>();
         var concurrentWarnings = new System.Collections.Concurrent.ConcurrentBag<string>();
 
-        // Only custom servers get a Power Platform connector; the platform signals that by returning a
-        // connector id and/or a redirect URI. For a classified first-party Dataverse server no proxy
-        // app was created (A365AppObjectId is null), so there's nothing to reconcile. If the CLI's name
-        // classification ever drifts from the platform's and a proxy app was created for a server the
-        // platform treats as first-party, the proxy credential is unused - delete it here rather than
-        // leave it in the tenant (the Public Clients app and its PPMI grant remain).
+        // Only custom servers get a Power Platform connector; the platform signals that with a connector
+        // id and/or a redirect URI. A classified first-party Dataverse server created no proxy app
+        // (A365AppObjectId is null), so there's nothing to reconcile here.
         var connectorCreated = !string.IsNullOrWhiteSpace(response.A365ProxyConnectorId)
             || !string.IsNullOrWhiteSpace(response.A365ProxyRedirectUri);
+        // A real v2 publish payload always carries McpServerAppId (the platform falls back to its own
+        // app id). A success response without it is the tooling layer's placeholder for a 2xx with an
+        // empty or undeserializable body, which proves nothing about whether the connector was created.
+        var hasPlatformPayload = !string.IsNullOrWhiteSpace(response.McpServerAppId);
         var proxyObjectId = apps.A365AppObjectId;
         if (!connectorCreated && !string.IsNullOrWhiteSpace(proxyObjectId))
         {
-            _logger.LogInformation("Publish returned no A365 proxy connector for '{ServerName}'; removing the unused A365 proxy app '{A365Proxy}'.", input.ServerName, apps.A365AppName);
-            var removed = await TryDeleteEntraAppAsync(tenantId, proxyObjectId, apps.A365AppClientId, apps.A365AppName, successVerb: "Removed unused");
-            if (!removed)
+            if (hasPlatformPayload)
             {
-                warnings.Add($"Unused A365 proxy app '{apps.A365AppName}' (clientId {apps.A365AppClientId ?? "<unknown>"}) could not be deleted automatically. Delete it manually in the Azure portal.");
+                // Real payload reporting no connector: the platform treats this server as first-party
+                // (the CLI's name classification drifted), so the proxy credential is unused - delete it.
+                _logger.LogInformation("Publish returned no A365 proxy connector for '{ServerName}'; removing the unused A365 proxy app '{A365Proxy}'.", input.ServerName, apps.A365AppName);
+                var removed = await TryDeleteEntraAppAsync(tenantId, proxyObjectId, apps.A365AppClientId, apps.A365AppName, successVerb: "Removed unused");
+                if (!removed)
+                {
+                    warnings.Add($"Unused A365 proxy app '{apps.A365AppName}' (clientId {apps.A365AppClientId ?? "<unknown>"}) could not be deleted automatically. Delete it manually in the Azure portal.");
+                }
+            }
+            else
+            {
+                // Empty/undeserializable 2xx body: the proxy credentials already went to the platform,
+                // which may have used them to create the connector, so keep the app rather than orphan
+                // that connector's OAuth client. Name it so the user can verify and remove it if unused.
+                var msg = $"Publish for '{input.ServerName}' returned no platform metadata, so A365 proxy connector creation could not be confirmed. Keeping the A365 proxy app '{apps.A365AppName}' (clientId {apps.A365AppClientId ?? "<unknown>"}); if no connector was created, delete it manually in the Azure portal.";
+                _logger.LogWarning(msg);
+                warnings.Add(msg);
             }
         }
 
